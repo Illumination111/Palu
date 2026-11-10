@@ -1,232 +1,111 @@
-
-import os, click
+"""Fisher rank selection; HF performs the causal-label shift exactly once."""
+import json
+from pathlib import Path
 import torch
-import torch.nn as nn
-from loguru import logger
-from .model import AVAILABLE_MODELS
-from .data_utils import get_calib_data
-import math
 from tqdm import tqdm
+from loguru import logger
+from .data_utils import get_calib_data, CACHE, digest
 
-def rounding_search_result(config: dict, block_size=32):
-    for module_name in config.keys():
-        ranks = config[module_name]
-        for i in range(len(ranks)):
-            ranks[i] = max(1, round(ranks[i] / block_size)) * block_size
-        config[module_name] = ranks
-    return config
+def kv_modules(model):
+    return {n: m for n, m in model.named_modules()
+            if isinstance(m, torch.nn.Linear) and n.endswith(("k_proj", "v_proj"))}
 
-def replace_with_mean(data):
-    result = {}
-    for key, value in data.items():
-        if value:
-            mean_value = sum(value) / len(value)
-            new_value = [mean_value] * len(value)
-            result[key] = new_value
-    return result
-
-def split_values(data, group_number):
-    result = {}
-    for key, value in data.items():
-        new_value = [v // group_number for v in value for _ in range(group_number)]
-        result[key] = new_value
-    return result
-
-
-def calib_fisher_info(model, calib_loader, device, use_cache=True):
-    model.half()
-    model.to(device)
-    model_id = model.config._name_or_path
-    cache_file = f"cache/{model_id.replace('/','_')}_calib_fisher_info.pt"
-
-    logger.info(f"[Fisher] Search cache_file={cache_file}", fg="yellow")
-
-    if os.path.exists(cache_file) and use_cache:
-        logger.info(f"[Fisher] File {cache_file} exist.", fg="green")
-        logger.info(f"[Fisher] Load cache_file={cache_file}", fg="yellow")
-        all_fisher_info = torch.load(cache_file, map_location="cpu")
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and "attn" in name:
-                module.fisher_info = all_fisher_info[name].to(module.weight.device)
+def calib_fisher_info(model, calib_loader, device, use_cache=True, legacy_double_shift=False):
+    targets = kv_modules(model)
+    meta = {"data": calib_loader.metadata, "protocol": "legacy_double_shift" if legacy_double_shift else "hf_single_shift_v2",
+            "source": digest(Path(__file__).read_text())}
+    cache_file = CACHE / f"fisher-{digest(meta)}.pt"
+    if use_cache and cache_file.exists():
+        saved = torch.load(cache_file, map_location="cpu", weights_only=False)
+        assert saved["meta"] == meta
+        for n, m in targets.items():
+            m.fisher_info = saved["fisher"][n]
+        logger.info(f"Fisher cache: {cache_file}")
         return
-    model.eval()
+    model.to(device).eval()  # Preserve FP32 rotary-frequency buffers.
+    original_grad = {n: p.requires_grad for n, p in model.named_parameters()}
+    original_cache = model.config.use_cache
+    model.config.use_cache = False
+    model.requires_grad_(False)
+    for m in targets.values():
+        m.weight.requires_grad_(True)
+        m.fisher_info = torch.zeros_like(m.weight, dtype=torch.float32)
+    losses = []
+    try:
+        for batch in tqdm(calib_loader, desc="Fisher samples", mininterval=5):
+            ids = batch["input_ids"].to(device)
+            inputs, labels = (ids[:, :-1], ids[:, 1:]) if legacy_double_shift else (ids, ids)
+            model.zero_grad(set_to_none=True)
+            loss = model(input_ids=inputs, labels=labels, use_cache=False).loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite Fisher loss")
+            loss.backward()
+            losses.append(loss.item())
+            for n, m in targets.items():
+                if m.weight.grad is None or not torch.isfinite(m.weight.grad).all():
+                    raise FloatingPointError(f"Invalid Fisher gradient: {n}")
+                m.fisher_info.add_(m.weight.grad.detach().float().square())
+        for m in targets.values():
+            m.fisher_info = (m.fisher_info / len(calib_loader)).sqrt().cpu()
+        CACHE.mkdir(parents=True, exist_ok=True)
+        torch.save({"meta": meta, "losses": losses, "fisher": {n:m.fisher_info for n,m in targets.items()}}, cache_file)
+        logger.info(f"Fisher saved: {cache_file}; mean loss={sum(losses)/len(losses):.6f}")
+    finally:
+        model.zero_grad(set_to_none=True)
+        for n, p in model.named_parameters():
+            p.requires_grad_(original_grad[n])
+        model.config.use_cache = original_cache
+        torch.cuda.empty_cache()
 
-    logger.info(f"[Fisher] No cache_file={cache_file}", fg="red")
-    logger.info(f"[Fisher] Create fisher info list...", fg="yellow")
+def allocate_ranks(weights, cap, ratio, multiplicity=1, block=32):
+    # Allocation is in integer blocks; equal groups in a module share one decision.
+    count = len(weights)
+    cap_blocks = cap // block
+    target = int(count * cap_blocks * ratio + 0.5)
+    if not count <= target <= count * cap_blocks:
+        raise ValueError("Target cannot satisfy the minimum rank block")
+    weights = [max(float(w), 1e-20) for w in weights]
+    ranks = [1] * count
+    # Discrete proportional allocation with saturation and deterministic tie order.
+    for _ in range(target-count):
+        eligible = [i for i in range(count) if ranks[i] < cap_blocks]
+        best = max(eligible, key=lambda i: weights[i] / (ranks[i] + 0.5))
+        ranks[best] += 1
+    return [r * block for r in ranks]
 
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and "attn" in name:
-            module.fisher_info = 0
-
-    # get fisher info
-    for batch in tqdm(calib_loader):
-        input_ids = batch["input_ids"][:, :-1].to(model.device)
-        labels = batch["input_ids"][:, 1:].to(model.device)
-        out = model(input_ids=input_ids, labels=labels)
-        out[0].backward()
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and "attn" in name:
-                module.fisher_info += module.weight.grad.detach().to(torch.float32).pow(2)
-        model.zero_grad()
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and "attn" in name:
-            module.fisher_info = module.fisher_info.div(len(calib_loader)).sqrt()
-
-    # remove and save fisher_info
-    all_fisher_info = {}
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and "attn" in name:
-            module._forward_hooks.clear()
-            all_fisher_info[name] = module.fisher_info
-
-    logger.info(f"[Fisher] Save the fisher info list to:  {cache_file}", fg="yellow")
-    torch.save(all_fisher_info, cache_file)
-
-def rank_search(model: nn.Module, tokenizer, args):
-    logger.info(f"[Rank search] Do rank searching. Search method: {args.search_method}", fg="yellow")
-    if args.search_method == "uniform":
-        target_model_class = AVAILABLE_MODELS[model.config.model_type]["ModelForCausalLM"]
-        total_rank = 0
-        select_result = {}
-        info = target_model_class.get_kv_info(model, args.head_group_size)
-        
-        for name, module in model.named_modules():
-            if "k_proj" in name or "v_proj" in name:                
-                module_rank = info.num_lr_groups * info.lr_group_dims
-                total_rank += module_rank
-                
-                select_result.update({name: [info.lr_group_dims*args.param_ratio_target] * info.num_lr_groups})
-
-        select_result = rounding_search_result(select_result)
-        rank_sum = sum([sum(v) for k, v in select_result.items()])
-        logger.info(f"[Rank search] KV-Cache Compression Ratio: {100-(rank_sum / total_rank * 100): .2f}%")
-        return select_result, rank_sum, total_rank    
-    elif args.search_method == "fisher":
-        # Prepare Fisher information
-        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen)
-        calib_fisher_info(model, calib_loader, torch.device(args.device), args.use_cache)
-        
-        
-        target_model_class = AVAILABLE_MODELS[model.config.model_type]["ModelForCausalLM"]
-        total_rank = 0
-        fisher_sum = 0.0
-        fisher_info_dict = {}
-        select_result = {}
-        
-        info = target_model_class.get_kv_info(model, args.head_group_size)
-        for name, module in model.named_modules():
-            if "k_proj" in name or "v_proj" in name:
-                module_rank = info.num_lr_groups * info.lr_group_dims
-                total_rank += module_rank
-                
-                select_result.update({name: [info.lr_group_dims] * info.num_lr_groups})
-                
-                fisher = module.fisher_info.reshape(info.num_lr_groups, -1, module.in_features)
-                if not torch.isfinite(fisher).all():
-                    logger.info(fisher)
-                
-                fisher_list = [torch.mean(fisher[i]).item() for i in range(info.num_lr_groups)]
-                fisher_info_dict.update({name: fisher_list})
-                fisher_sum += sum(fisher_list)
-
-
-        target_rank = total_rank * args.param_ratio_target
-        
-        indexes = []
-        select_result_float = {}
-
-        for name, fisher in fisher_info_dict.items():
-            ranks = []
-            for i in range(len(fisher)):
-                rank_float = target_rank * fisher[i] / fisher_sum
-                
-                ranks.append(rank_float)
-                indexes.append((name, i))
-                select_result[name][i] = min(select_result[name][i], math.floor(rank_float))
-
-            select_result_float.update({name: ranks})
-                
-        indexes = sorted(indexes, key=lambda x: select_result_float[x[0]][x[1]] - select_result[x[0]][x[1]])
-        dif = target_rank - sum([sum(v) for k, v in select_result.items()])
-
-
-        while dif > 0:
-            for i in range(len(indexes)):
-                if select_result[indexes[i][0]][indexes[i][1]] == info.lr_group_dims:
-                    continue
-                select_result[indexes[i][0]][indexes[i][1]] += 1
-                dif -= 1
-
-                if dif == 0:
-                    break
-                
-        select_result = rounding_search_result(select_result)
-        rank_sum = sum([sum(v) for k, v in select_result.items()])
-        logger.info(f"[Rank Search] KV-Cache Compression Ratio: {100-(rank_sum / total_rank * 100): .2f}%")
-        
-        return select_result, rank_sum, total_rank    
-    elif args.search_method == "fisher_uniform":
-        # Prepare Fisher information
-        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen)
-        calib_fisher_info(model, calib_loader, torch.device(args.device), args.use_cache)
-        
-        target_model_class = AVAILABLE_MODELS[model.config.model_type]["ModelForCausalLM"]
-            
-        total_rank = 0
-        
-        fisher_sum = 0.0
-        fisher_info_dict = {}
-        select_result = {}
-        info = target_model_class.get_kv_info(model, model.config.num_key_value_heads)
-        
-        for name, module in model.named_modules():
-            if "k_proj" in name or "v_proj" in name:
-                module_rank = info.num_lr_groups * info.lr_group_dims
-                total_rank += module_rank
-                
-                select_result.update({name: [info.lr_group_dims] * info.num_lr_groups})
-                fisher = module.fisher_info.reshape(info.num_lr_groups, -1, module.in_features)
-                
-                fisher_list = [torch.mean(fisher[i]).item() for i in range(info.num_lr_groups)]
-                fisher_info_dict.update({name: fisher_list})
-                fisher_sum += sum(fisher_list)
-
-
-        target_rank = total_rank * args.param_ratio_target
-        
-        indexes = []
-        select_result_float = {}
-
-        for name, fisher in fisher_info_dict.items():
-            ranks = []
-            for i in range(len(fisher)):
-                rank_float = target_rank * fisher[i] / fisher_sum    
-                ranks.append(rank_float)
-                indexes.append((name, i))
-                select_result[name][i] = min(select_result[name][i], math.floor(rank_float))
-
-            select_result_float.update({name: ranks})
-            
-        indexes = sorted(indexes, key=lambda x: select_result_float[x[0]][x[1]] - select_result[x[0]][x[1]])
-        dif = target_rank - sum([sum(v) for k, v in select_result.items()])
-
-
-        while dif > 0:
-            for i in range(len(indexes)):
-                if select_result[indexes[i][0]][indexes[i][1]] == info.lr_group_dims:
-                    continue
-                select_result[indexes[i][0]][indexes[i][1]] += 1
-                dif -= 1
-
-                if dif == 0:
-                    break
-        
-        select_result = split_values(select_result, model.config.num_key_value_heads//args.head_group_size)
-        select_result = rounding_search_result(select_result)
-        rank_sum = sum([sum(v) for k, v in select_result.items()])
-        logger.info(f"[Rank Search] KV-Cache Compression Ratio: {100-(rank_sum / total_rank * 100): .2f}%")
-        
-        return select_result, rank_sum, total_rank
-    else:
-        raise NotImplementedError  
+def rank_search(model, tokenizer, args):
+    if not 0 < args.param_ratio_target <= 1:
+        raise ValueError("param_ratio_target must be in (0, 1]")
+    kv_heads = model.config.num_key_value_heads
+    if kv_heads % args.head_group_size:
+        raise ValueError("KV heads must be divisible by group size")
+    groups = kv_heads // args.head_group_size
+    cap = args.head_group_size * (model.config.hidden_size // model.config.num_attention_heads)
+    targets = kv_modules(model)
+    if args.search_method != "uniform":
+        loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id,
+                               args.n_fisher_calib_samples, args.calib_seqlen, args.seed)
+        calib_fisher_info(model, loader, args.device, args.use_cache,
+                          getattr(args, "legacy_double_shift", False))
+    keys, weights = [], []
+    for n, m in targets.items():
+        if args.search_method == "fisher":
+            for i, f in enumerate(m.fisher_info.reshape(groups, -1, m.in_features)):
+                keys.append((n, i)); weights.append(f.mean().item())
+        else:
+            keys.append((n, None))
+            weights.append(1.0 if args.search_method == "uniform" else m.fisher_info.mean().item())
+    values = allocate_ranks(weights, cap, args.param_ratio_target)
+    selected = {n: [0]*groups for n in targets}
+    for (n, i), value in zip(keys, values):
+        if i is None:
+            selected[n] = [value]*groups
+        else:
+            selected[n][i] = value
+    for m in targets.values():
+        if hasattr(m, "fisher_info"):
+            del m.fisher_info
+    rank_sum = sum(map(sum, selected.values()))
+    total = len(targets)*groups*cap
+    logger.info(f"Selected rank fraction {rank_sum/total:.6f}; requested={args.param_ratio_target}")
+    return selected, rank_sum, total

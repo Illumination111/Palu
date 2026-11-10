@@ -34,7 +34,7 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[0], prompt)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
-    elif "mistral-v0.2-instruct" in model_name.lower():
+    elif "mistral-v0.2-instruct" in model_name.lower() or "mistral-7b-instruct-v0.3" in model_name.lower():
         messages = [
             {
                 "role": "user",
@@ -55,10 +55,11 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
             half = int(max_length/2)
             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
 
-        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
+        templated = dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
+        if templated: # chat models are better off without build prompts on these tasks
             prompt = build_chat(tokenizer, prompt, model_name)
         
-        input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+        input = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=not templated).to(device)
         context_length = input.input_ids.shape[-1]
         if dataset == "samsum": # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
             output = model.generate(

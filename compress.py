@@ -6,7 +6,6 @@ from utils import set_seed, dump_to_huggingface_repos, load_model_and_tokenizer
 from palu.rank_search import rank_search
 from tqdm import tqdm
 from palu.decomposition import compress_model
-from run_lm_eval import run_lm_eval_zero_shot
 import os
 
 def compress(args):
@@ -22,7 +21,7 @@ def compress(args):
     compress_model(model, tokenizer, args, args.device, search_results)
     
     if args.dump_huggingface_model:
-        save_folder = f"{args.model_id.split('/')[-1]}_ratio-{args.param_ratio_target}_gs-{args.head_group_size}-{args.search_method}-{args.decompose_method}"
+        save_folder = args.output_dir or f"{args.model_id.split('/')[-1]}_ratio-{args.param_ratio_target}_gs-{args.head_group_size}-{args.search_method}-{args.decompose_method}"
         dump_to_huggingface_repos(model, tokenizer, save_folder, args)
         logger.info(f"Huggingface model is saved to {save_folder}", fg="green")
     
@@ -127,6 +126,9 @@ if __name__ == "__main__":
         help='Decomposition method'
     )
     
+    parser.add_argument("--whiten_seqlen", type=int, default=2048)
+    parser.add_argument("--output_dir", type=str)
+    parser.add_argument("--legacy_double_shift", action="store_true")
     args = parser.parse_args()
     
     logger.remove()

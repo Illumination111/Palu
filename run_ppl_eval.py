@@ -9,112 +9,60 @@ from palu.quant_utils import configure_latent_quantizer
 from loguru import logger
 
 def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
-    if "wikitext2" in name:
-        testdata = load_dataset(
-            "wikitext",
-            "wikitext-2-raw-v1",
-            split="test",
-        )
-        testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
-        return testenc
-    elif "c4" in name:
-        # Wrapper for tokenized input IDs
-        class TokenizerWrapper:
-            def __init__(self, input_ids):
-                self.input_ids = input_ids
-                
-        valdata = load_dataset(
-            "allenai/c4",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-            split="validation",
-        )
-        testenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-        testenc = testenc.input_ids[:, :(256 * seqlen)]
-        testenc = TokenizerWrapper(testenc)
-        return testenc
-    else:
-        raise NotImplementedError
-    
-
-def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
-    if "wikitext2" in name:
-        testdata = load_dataset(
-            "wikitext",
-            "wikitext-2-raw-v1",
-            split="test",
-        )
-        testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
-        return testenc
-    elif "c4" in name:
-        # Wrapper for tokenized input IDs
-        class TokenizerWrapper:
-            def __init__(self, input_ids):
-                self.input_ids = input_ids
-                
-        valdata = load_dataset(
-            "allenai/c4",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-            split="validation",
-        )
-        #testenc = tokenizer("\n\n".join(valdata["text"]), return_tensors="pt")
-        testenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-        testenc = testenc.input_ids[:, :(256 * seqlen)]
-        testenc = TokenizerWrapper(testenc)
-        return testenc
-    else:
-        raise NotImplementedError
+    from palu.data_utils import wiki_split
+    if name == "wikitext2":
+        return tokenizer("\n\n".join(wiki_split("test")["text"]), return_tensors="pt")
+    if name == "c4":
+        from pathlib import Path
+        path = Path(__file__).parent / "dataset-benchmark/c4/c4-validation.00000-of-00008.json.gz"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        valdata = load_dataset("json", data_files=str(path), split="train")
+        result = tokenizer(" ".join(valdata[:1100]["text"]), return_tensors="pt")
+        result["input_ids"] = result.input_ids[:, :256*seqlen]
+        return result
+    raise ValueError(name)
 
 @torch.no_grad()
-def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda"):
-    model = model.to(device)
-    if isinstance(device, str):
-        device = torch.device(device)
-
+def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda", max_samples=None):
+    import math
+    model.to(device).eval()
     results = {}
-
-    for dataset in datasets.split(","):
-        cache_testloader = (
-            f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
-        )
-        if os.path.exists(cache_testloader):
-            testloader = torch.load(cache_testloader)
-        else:
-            testloader = get_ppl_eval_loaders(dataset, tokenizer)
-            torch.save(testloader, cache_testloader)
-        
-        testenc = testloader.input_ids
-        nsamples = testenc.numel() // seqlen
-        use_cache = model.config.use_cache
-        model.config.use_cache = False
-        model.eval()
-
-        nlls = []
-
-        for i in tqdm(range(nsamples)):
-            batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(
-                    device
-                )
-            outputs = model.model(batch)
-            hidden_states = outputs[0]
-            logits = model.lm_head(hidden_states)  # .contiguous()
-            shift_logits = logits[:, :-1, :]  # .contiguous()
-            shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][
-                :, 1:
-            ].to(device)
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-            
-            neg_log_likelihood = loss.float() * seqlen
-            nlls.append(neg_log_likelihood)
-            
-        ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen))
-        model.config.use_cache = use_cache
-        results.update({dataset: ppl.item()})
-
+    stats = {}
+    original_cache = model.config.use_cache
+    model.config.use_cache = False
+    try:
+        for dataset in datasets.split(","):
+            ids = get_ppl_eval_loaders(dataset, tokenizer, seqlen).input_ids
+            count = ids.numel() // seqlen
+            if max_samples is not None:
+                count = min(count, max_samples)
+            if count < 1:
+                raise ValueError("No complete PPL blocks")
+            nll, tokens = 0., 0
+            for i in tqdm(range(count), desc=f"PPL {dataset}", mininterval=5):
+                batch = ids[:, i*seqlen:(i+1)*seqlen].to(device)
+                hidden = model.model(batch, use_cache=False)[0]
+                # Chunk the vocabulary projection to bound FP32-logit memory.
+                for offset in range(0, seqlen-1, 128):
+                    end = min(offset+128, seqlen-1)
+                    logits = model.lm_head(hidden[:, offset:end]).float()
+                    loss = nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                              batch[:, offset+1:end+1].reshape(-1), reduction="sum")
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("Nonfinite PPL loss")
+                    nll += loss.item(); tokens += end-offset
+            results[dataset] = math.exp(nll/tokens)
+            import hashlib
+            stats[dataset] = {"blocks": count, "seqlen": seqlen, "scored_tokens": tokens,
+                "nll_sum": nll, "input_ids_sha256": hashlib.sha256(ids[:, :count*seqlen].numpy().tobytes()).hexdigest(),
+                "split": "test" if dataset == "wikitext2" else "validation"}
+            logger.info(f"{dataset}: PPL={results[dataset]}, blocks={count}, targets={tokens}")
+    finally:
+        model.config.use_cache = original_cache
+    eval_ppl.last_stats = stats
     return results
-    
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -122,6 +70,8 @@ if __name__ == '__main__':
     parser.add_argument('--seqlen', type=int, help='sequence length for ppl evaluation', default=2048)
     parser.add_argument("--device", type=str, help="device to run the model on", default="cuda")
     parser.add_argument("--verbose", action="store_true", help="Whether to print verbose information or not.")
+    parser.add_argument("--max_samples", type=int)
+    parser.add_argument("--output_json", type=str)
     args = parser.parse_args()
     
     logger.remove()
@@ -140,6 +90,11 @@ if __name__ == '__main__':
     logger.info(f"*model: {args.model_name_or_path}")
     logger.info(f"*datasets: {args.datasets}")
     logger.info(f"*sequence length {args.seqlen}")
-    results = eval_ppl(model, tokenizer, args.model_name_or_path, args.datasets, args.seqlen, args.device)
+    results = eval_ppl(model, tokenizer, args.model_name_or_path, args.datasets, args.seqlen, args.device, args.max_samples)
     for dataset, ppl in results.items():
         logger.info(f"PPL: {ppl}")
+    if args.output_json:
+        import json
+        from pathlib import Path
+        Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output_json).write_text(json.dumps({"args": vars(args), "results": results, "statistics": eval_ppl.last_stats}, indent=2))

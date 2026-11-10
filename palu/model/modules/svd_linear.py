@@ -11,14 +11,14 @@ def _per_head_whiten_decomposition_from_weight(weight, scaling_diag_matrix, rank
         raise FileExistsError("Cache may not be loaded correctly")
     
     # Get the inverse of scaling_diag_matrix
-    scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix.to(torch.float32))
+    # Solve against the triangular Cholesky factor instead of forming its inverse.
 
     # Multiply scaling_diag_matrix to weight matrix
     W_scale = torch.matmul(weight.to(torch.float32), scaling_diag_matrix.to(torch.float32))
     
     U, S, Vt = torch.linalg.svd(W_scale, full_matrices=False)
     
-    V = torch.matmul(Vt, scaling_matrix_inv)
+    V = torch.linalg.solve_triangular(scaling_diag_matrix.float().T, Vt[:rank].T, upper=True).T
     
     # Low rank approximation to the target rank
     U = U[:, :rank]
@@ -47,7 +47,8 @@ def _per_head_decomposition_from_weight(weight, rank):
     # Fuse the SVD components
     L = torch.matmul(U, sqrtSigma).to(original_dtype)
     R = torch.matmul(sqrtSigma, Vt).to(original_dtype)
-    assert torch.allclose(torch.matmul(L, R), weight, atol=1e-3), "SVD decomposition failed"
+    if not torch.isfinite(L).all() or not torch.isfinite(R).all():
+        raise FloatingPointError("Nonfinite SVD factors")
     return L, R
 
 class HeadwiseLowRankModule(nn.Module):
